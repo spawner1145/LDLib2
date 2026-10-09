@@ -41,11 +41,21 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
     private final Map<IResourcePath, T> cache = new ConcurrentHashMap<>();
     private final PackFileResourceProvider<T> packFileProvider = new PackFileResourceProvider<>(this);
     private final DirectFileResourceProvider<T> directFileProvider = new DirectFileResourceProvider<>(this);
+    // providers shown without being registered, e.g. the asset browser's own over a folder no provider covers
+    private final Set<IResourceProvider<T>> unlistedProviders = Collections.newSetFromMap(new IdentityHashMap<>());
+    // bumped whenever a provider is added or removed (unlisted ones aside), so what was built over them can tell
+    // it is stale
+    @Getter
+    private int providersVersion;
 
     @Getter
     private Resource.DisplayMode displayMode;
     @Getter
     private int uiWidth;
+    @Getter
+    private Resource.SortMode sortMode = Resource.SortMode.DEFAULT;
+    @Getter
+    private boolean sortAscending = true;
 
     public ResourceInstance(Resource<T> resource) {
         this.resource = resource;
@@ -110,6 +120,15 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
             if (result.isPresent()) {
                 cache.put(path, result.get());
                 return result.get();
+            }
+            // a folder the asset browser has open: one copy, the one it edits and saves, rather than a second read
+            for (var provider : unlistedProviders) {
+                if (!provider.hasResource(path)) continue;
+                var unlisted = provider.getResource(path);
+                if (unlisted != null) {
+                    cache.put(path, unlisted);
+                    return unlisted;
+                }
             }
             // a resource file inside the game dir that no provider owns, e.g. one stored in a folder the
             // user created through the asset browser. Checked before the pack tier because
@@ -199,16 +218,32 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
 
     /**
      * Looks up the entry of the given resource. The resource is matched by identity first, then by
-     * {@link Object#equals(Object)}.
+     * {@link Object#equals(Object)}. What an {@link #addUnlistedProvider unlisted provider} has read is matched by
+     * identity too.
      *
      * @param value the resource to look up, can be null.
-     * @return the entry of the resource, or null if it's not provided by this instance.
+     * @return the entry of the resource, or null if no provider of this instance, listed or not, holds it.
      */
     @Nullable
     public ResourceEntry<T> findResourceEntry(@Nullable T value) {
         if (value == null) return null;
+        var entries = listAllResourceEntries();
+        // what has been read already comes first: a provider that reads lazily reads a file on getResource,
+        // so asking every entry reads everything listed before the one the value came from
+        for (var entry : entries) {
+            if (entry.provider().getLoadedResource(entry.path()) == value || cache.get(entry.path()) == value) {
+                return entry;
+            }
+        }
+        for (var provider : unlistedProviders) {
+            for (var entry : provider) {
+                if (provider.getLoadedResource(entry.getKey()) == value) {
+                    return new ResourceEntry<>(provider, entry.getKey());
+                }
+            }
+        }
         ResourceEntry<T> equalsMatch = null;
-        for (var entry : listAllResourceEntries()) {
+        for (var entry : entries) {
             var resource = entry.getResource();
             if (resource == value) {
                 return entry;
@@ -256,6 +291,18 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
         }
     }
 
+    public void setSortMode(Resource.SortMode sortMode) {
+        if (this.sortMode == sortMode) return;
+        this.sortMode = sortMode;
+        saveResource();
+    }
+
+    public void setSortAscending(boolean sortAscending) {
+        if (this.sortAscending == sortAscending) return;
+        this.sortAscending = sortAscending;
+        saveResource();
+    }
+
     /** Writes the display settings of this instance to its meta file. */
     public void saveSettings() {
         saveResource();
@@ -281,17 +328,50 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
         clearCache();
     }
 
+    /**
+     * A provider over a folder no registered provider covers, e.g. the asset browser's own, that is known without
+     * being listed or saved. While it is, {@link #getResource} hands out what it reads, so the copy the browser
+     * shows and edits is the one everything else draws with; and {@link #findResourceEntry} maps it back to its path.
+     */
+    public void addUnlistedProvider(IResourceProvider<T> provider) {
+        // what was resolved before has to be resolved again, through it
+        if (unlistedProviders.add(provider)) clearCache();
+    }
+
+    public void removeUnlistedProvider(IResourceProvider<T> provider) {
+        if (unlistedProviders.remove(provider)) clearCache();
+    }
+
+    /**
+     * Writes a resource that no registered provider owns: through the unlisted provider holding it, else straight to
+     * its file. A provider is not required to edit a file the editor reached, wherever it lies in the game folder.
+     *
+     * @return whether it was written.
+     */
+    public boolean writeUnowned(IResourcePath path, T value) {
+        for (var provider : unlistedProviders) {
+            if (provider.hasResource(path) && provider.canEdit(path)) {
+                return provider.addResource(path, value);
+            }
+        }
+        if (!directFileProvider.writeResource(path, value)) return false;
+        cache.put(path, value);
+        return true;
+    }
+
     private void addResourceProvider(Map<ResourceProviderType, List<IResourceProvider<T>>> resourceProviders, IResourceProvider<T> provider) {
         var type = provider.getType();
         if (resourceProviders.containsKey(type)) {
             var providers = resourceProviders.get(type);
             if (!providers.contains(provider)) {
                 providers.add(provider);
+                providersVersion++;
             }
         } else {
             var list = new ArrayList<IResourceProvider<T>>();
             list.add(provider);
             resourceProviders.put(type, list);
+            providersVersion++;
         }
     }
 
@@ -299,7 +379,9 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
         var type = provider.getType();
         if (resourceProviders.containsKey(type)) {
             var providers = resourceProviders.get(type);
-            providers.remove(provider);
+            if (providers.remove(provider)) {
+                providersVersion++;
+            }
             if (providers.isEmpty()) {
                 resourceProviders.remove(type);
             }
@@ -357,6 +439,8 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
         });
         var dialog = new Dialog()
                 .windowMode(mouseX, mouseY)
+                // one size for every resource type's selector
+                .rememberSize("resource_selector")
                 .setTitle("resource.selector.select_resource")
                 .addContent(new UIElement().layout(layout -> {
                     layout.widthPercent(100);
@@ -436,6 +520,8 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
 
         data.putString("displayMode", displayMode.name());
         data.putInt("uiWidth", uiWidth);
+        data.putString("sortMode", sortMode.name());
+        data.putBoolean("sortAscending", sortAscending);
 
         var customProviders = new CompoundTag();
         for (var type : LDLib2Registries.RESOURCE_PROVIDER_TYPES) {
@@ -459,11 +545,20 @@ public class ResourceInstance<T> implements INBTSerializable<CompoundTag> {
     public void deserializeNBT(@Nonnull HolderLookup.Provider provider, @Nonnull CompoundTag nbt) {
         clearCache();
         customProviders.clear();
+        providersVersion++;
 
         try {
             displayMode = Resource.DisplayMode.valueOf(nbt.getString("displayMode"));
         } catch (IllegalArgumentException ignored) {}
         uiWidth = nbt.getInt("uiWidth");
+        if (nbt.contains("sortMode")) {
+            try {
+                sortMode = Resource.SortMode.valueOf(nbt.getString("sortMode"));
+            } catch (IllegalArgumentException ignored) {}
+        }
+        if (nbt.contains("sortAscending")) {
+            sortAscending = nbt.getBoolean("sortAscending");
+        }
 
         // compatible with previous
         if (nbt.contains("fileProviders")) {

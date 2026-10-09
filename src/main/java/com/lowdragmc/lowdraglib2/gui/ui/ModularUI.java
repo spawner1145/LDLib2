@@ -61,6 +61,7 @@ import javax.annotation.ParametersAreNonnullByDefault;
 import java.io.File;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -181,6 +182,11 @@ public class ModularUI {
     /** A queued {@link #setDebuggerWindowed} — see {@link #applyPendingDebuggerHost}. */
     @Nullable
     private Boolean pendingDebuggerWindowed;
+    /** Live UIs drawn inside an element of another UI, see {@link #embedIn}. Global because the host element may move between UIs. */
+    private static final Set<ModularUI> EMBEDDED_UIS = new LinkedHashSet<>();
+    @Nullable
+    private UIElement embeddingHost;
+    private String embeddedName = "";
     /**
      * Whether this UI has been torn down and not re-initialised since.
      *
@@ -638,6 +644,7 @@ public class ModularUI {
      */
     public void onRemoved() {
         removed = true;
+        EMBEDDED_UIS.remove(this);
         ui.rootElement.onRemoved();
         styleEngine.dispose();
     }
@@ -889,11 +896,11 @@ public class ModularUI {
      * <p>For a keymap that resolved the chord itself: the action still has to reach whatever holds the
      * selection, and that routing lives in one place.
      *
-     * @return true if anything handled it.
+     * @return true if a handler stopped or claimed it.
      */
     @OnlyIn(Dist.CLIENT)
     public boolean dispatchCommand(String command) {
-        return getWidget().dispatchCommand(command, lastPressedKeyCode, lastPressedScanCode, lastPressedModifiers);
+        return getWidget().dispatchCommand(command, lastPressedKeyCode, lastPressedScanCode, lastPressedModifiers, true);
     }
 
     @OnlyIn(Dist.CLIENT)
@@ -1039,6 +1046,64 @@ public class ModularUI {
         return debugMode && uiDebuggerCache != null && uiDebuggerCache.isFocusMode();
     }
 
+    /**
+     * Marks this UI as drawn inside {@code host}, an element of another UI (e.g. the UI editor's simulation canvas),
+     * so the debugger can reach it: F3 with focus inside the host targets it and the target pickers list it.
+     * The host still draws it and feeds it input. Undone by {@link #onRemoved()}.
+     *
+     * @param name label shown in the debugger's target picker
+     */
+    @OnlyIn(Dist.CLIENT)
+    public void embedIn(UIElement host, String name) {
+        this.embeddingHost = host;
+        this.embeddedName = name;
+        EMBEDDED_UIS.add(this);
+    }
+
+    /** The UI owning the screen or window this one is shown in: itself unless embedded. */
+    @OnlyIn(Dist.CLIENT)
+    public ModularUI getOutermostUI() {
+        var current = this;
+        while (current.embeddingHost != null && current.embeddingHost.getModularUI() != null) {
+            current = current.embeddingHost.getModularUI();
+        }
+        return current;
+    }
+
+    /** The UIs embedded directly in an element of this one. */
+    @OnlyIn(Dist.CLIENT)
+    public List<ModularUI> getEmbeddedUIs() {
+        var result = new ArrayList<ModularUI>();
+        for (var embedded : EMBEDDED_UIS) {
+            if (!embedded.removed && embedded.embeddingHost != null && embedded.embeddingHost.getModularUI() == this) {
+                result.add(embedded);
+            }
+        }
+        return result;
+    }
+
+    /** Visits every UI embedded in this one, however deeply, labelled by its path from {@code label}, e.g. {@code "Game Window / Simulation"}. */
+    @OnlyIn(Dist.CLIENT)
+    public void visitEmbeddedUIs(String label, BiConsumer<String, ModularUI> visitor) {
+        for (var embedded : getEmbeddedUIs()) {
+            var path = label + " / " + embedded.embeddedName;
+            visitor.accept(path, embedded);
+            embedded.visitEmbeddedUIs(path, visitor);
+        }
+    }
+
+    /** The UI F3 opens a debugger on: the embedded UI whose host holds focus, otherwise this one. */
+    @OnlyIn(Dist.CLIENT)
+    private ModularUI debugTargetAtFocus() {
+        if (focusedElement == null) return this;
+        for (var embedded : getEmbeddedUIs()) {
+            if (embedded.allowDebugMode && embedded.embeddingHost.isAncestorOf(focusedElement)) {
+                return embedded.debugTargetAtFocus();
+            }
+        }
+        return this;
+    }
+
     @ParametersAreNonnullByDefault
     @MethodsReturnNonnullByDefault
     @OnlyIn(Dist.CLIENT)
@@ -1111,11 +1176,13 @@ public class ModularUI {
                     for (int i = structurePath.size() - 1; i >= 0; i--) {
                         var element = structurePath.get(i);
                         if (element.isFocusable()) {
-                            requestFocus(element);
+                            if (element.isActiveInHierarchy()) {
+                                requestFocus(element);
+                            }
                             break;
                         }
                     }
-                } else if (lastMouseDownElement.isActive()) {
+                } else if (lastMouseDownElement.isActiveInHierarchy()) {
                     requestFocus(lastMouseDownElement);
                 }
                 var event = UIEvent.create(UIEvents.MOUSE_DOWN);
@@ -1286,7 +1353,10 @@ public class ModularUI {
         @Override
         public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
             if (allowDebugMode && keyCode == GLFW.GLFW_KEY_F3) {
-                enableDebugger(!debugMode);
+                var target = debugTargetAtFocus();
+                target.enableDebugger(!target.debugMode);
+                // consume it, or the host forwards the same F3 into the embedded UI and toggles it back
+                if (target != ModularUI.this) return true;
             }
             // The debugger's own chords, handled here so they work with the pointer over the UI being
             // inspected — which, now that the debugger is a window of its own, is not where its
@@ -1368,9 +1438,8 @@ public class ModularUI {
         /**
          * Runs one of the {@link CommandEvents} against the UI, the way a key chord does.
          *
-         * <p>With something focused the command goes straight to it — a copy belongs to whatever has
-         * the selection, not to whichever ancestor listens for copies. With nothing focused there is no
-         * such answer, so the UI is asked who wants it and the first taker gets it.
+         * <p>With something focused the command starts there and bubbles, so a handler that acts on it must
+         * stop it. With nothing focused the first element to claim it gets it.
          *
          * <p>Public because a keymap resolves its own chords and then needs this exact routing to reach
          * the same handlers a built-in chord would have.
@@ -1378,23 +1447,31 @@ public class ModularUI {
          * @return true if anything handled the command.
          */
         public boolean dispatchCommand(String command, int keyCode, int scanCode, int modifiers) {
+            return dispatchCommand(command, keyCode, scanCode, modifiers, false);
+        }
+
+        /**
+         * @param taken answer whether a handler stopped or claimed it, not whether any listener heard it — which is
+         *              what decides if the key press is kept from the game.
+         */
+        public boolean dispatchCommand(String command, int keyCode, int scanCode, int modifiers, boolean taken) {
             if (focusedElement != null) {
                 var event = createExecuteCommandEvent(command, keyCode, scanCode, modifiers);
                 event.target = focusedElement;
                 UIEventDispatcher.dispatchEvent(event);
-                return event.hasHandler;
+                return taken ? event.propagationStopped : event.hasHandler;
             }
             var event = createValidCommandEvent(command, keyCode, scanCode, modifiers);
             event.target = ui.rootElement;
-            var handled = UIEventDispatcher.dispatchAllChildren(event);
+            var claimed = UIEventDispatcher.dispatchAllChildren(event) && event.currentElement != null;
             var hasHandler = event.hasHandler;
-            if (handled && event.currentElement != null) {
+            if (claimed) {
                 var executeCommandEvent = createExecuteCommandEvent(command, keyCode, scanCode, modifiers);
                 executeCommandEvent.target = event.currentElement;
                 UIEventDispatcher.dispatchEvent(executeCommandEvent);
                 hasHandler |= executeCommandEvent.hasHandler;
             }
-            return hasHandler;
+            return taken ? claimed : hasHandler;
         }
 
         protected UIEvent createValidCommandEvent(String command, int keyCode, int scanCode, int modifiers) {
@@ -1410,7 +1487,7 @@ public class ModularUI {
 
         protected UIEvent createExecuteCommandEvent(String command, int keyCode, int scanCode, int modifiers) {
             var event = UIEvent.create(UIEvents.EXECUTE_COMMAND);
-            event.hasBubblePhase = false;
+            event.hasBubblePhase = true;
             event.hasCapturePhase = false;
             event.keyCode = keyCode;
             event.scanCode = scanCode;
@@ -1535,7 +1612,8 @@ public class ModularUI {
             // Above the UI's own content, below its tooltips - and drawn here, in the inspected UI's
             // frame, because the debugger showing these outlines may well be in a different window.
             if (debugMode && uiDebuggerCache != null) {
-                uiDebuggerCache.renderHostOverlay(guiGraphics, mouseX, mouseY);
+                // root-local mouse, the raw one is offset by the host when this UI is embedded
+                uiDebuggerCache.renderHostOverlay(guiGraphics, (int) lastMouseX, (int) lastMouseY);
             }
 
             if (screen instanceof AbstractContainerScreen<?> containerScreen && !containerScreen.getMenu().getCarried().isEmpty()) {

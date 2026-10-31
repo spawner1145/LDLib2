@@ -32,6 +32,7 @@ import dev.vfyjxf.taffy.tree.TaffyTree;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.experimental.Accessors;
+import net.minecraft.Util;
 import net.minecraft.MethodsReturnNonnullByDefault;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
@@ -62,6 +63,7 @@ import java.io.File;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
+import java.util.function.LongConsumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -126,6 +128,7 @@ public class ModularUI {
     private final Map<NodeId, UIElement> elementByNode = new HashMap<>();
     private final Set<NodeId> nodesWithNewLayout = new HashSet<>();
     private final Set<NodeId> nodesWithNewGeometry = new HashSet<>();
+    private final List<LongConsumer> frameCallbacks = new ArrayList<>();
 
     // UI state
     @Getter @Setter
@@ -256,6 +259,26 @@ public class ModularUI {
 
         // Enqueue StyleEngine
         styleEngine.onElementRegister(element);
+    }
+
+    /**
+     * Moves an already registered element's id lookup from {@code previousId} to its current id.
+     * Called by {@link UIElement#setId} when the id changes while the element is attached.
+     */
+    public void onElementIdChanged(UIElement element, @Nullable String previousId) {
+        if (previousId != null && !previousId.isEmpty()) {
+            var previous = elementsById.get(previousId);
+            if (previous != null) {
+                previous.remove(element);
+                if (previous.isEmpty()) {
+                    elementsById.remove(previousId);
+                }
+            }
+        }
+        var id = element.getId();
+        if (id != null && !id.isEmpty()) {
+            elementsById.computeIfAbsent(id, k -> new ArrayList<>()).add(element);
+        }
     }
 
     /**
@@ -627,6 +650,34 @@ public class ModularUI {
         }
     }
 
+    /**
+     * Registers a callback to run once per rendered frame, just before style and layout settle, so
+     * tree changes it makes are laid out in that same frame.
+     *
+     * <p>Frames are not ticks: this fires at the render rate, and also for a UI that has no
+     * {@link Screen} behind it. The callback receives {@link Util#getNanos()} sampled once at the
+     * top of the frame, shared by every callback in it. A callback may add or remove callbacks,
+     * including itself, while it runs.
+     *
+     * @see #removeFrameCallback
+     */
+    public void addFrameCallback(LongConsumer callback) {
+        frameCallbacks.add(callback);
+    }
+
+    public void removeFrameCallback(LongConsumer callback) {
+        frameCallbacks.remove(callback);
+    }
+
+    private void runFrameCallbacks() {
+        if (frameCallbacks.isEmpty()) return;
+        var nanos = Util.getNanos();
+        // Copied: callbacks may register or unregister callbacks during the walk.
+        for (var callback : List.copyOf(frameCallbacks)) {
+            callback.accept(nanos);
+        }
+    }
+
     public void tick() {
         ui.rootElement.screenTick();
         tickCounter++;
@@ -641,11 +692,17 @@ public class ModularUI {
     /**
      * Called when the UI is removed.
      * This method can be overridden to perform cleanup tasks.
+     * <p>
+     * The root element is only torn down if it still belongs to this UI: one that has been moved into
+     * another {@link ModularUI} (a screen, an OS window) lives on there.
      */
     public void onRemoved() {
         removed = true;
         EMBEDDED_UIS.remove(this);
-        ui.rootElement.onRemoved();
+        var owner = ui.rootElement.getModularUI();
+        if (owner == null || owner == this) {
+            ui.rootElement.onRemoved();
+        }
         styleEngine.dispose();
     }
 
@@ -1230,7 +1287,7 @@ public class ModularUI {
                     UIEventDispatcher.dispatchEvent(clickEvent);
                     hasHandler |= clickEvent.hasHandler;
                     if (lastMouseClickElement == releasedElement && button == lastMouseClickButton) {
-                        if (System.currentTimeMillis() - lastMouseClickTime < 300) { // 300ms follow HTML5 spec
+                        if (Util.getMillis() - lastMouseClickTime < 300) { // 300ms follow HTML5 spec
                             var doubleClickEvent = UIEvent.create(UIEvents.DOUBLE_CLICK);
                             doubleClickEvent.x = (float) mouseX;
                             doubleClickEvent.y = (float) mouseY;
@@ -1247,11 +1304,11 @@ public class ModularUI {
                     }
                 }
                 lastMouseClickButton = button;
-                lastMouseClickTime = System.currentTimeMillis();
+                lastMouseClickTime = Util.getMillis();
                 return hasHandler;
             }
             lastMouseClickButton = button;
-            lastMouseClickTime = System.currentTimeMillis();
+            lastMouseClickTime = Util.getMillis();
             return false;
         }
 
@@ -1577,6 +1634,9 @@ public class ModularUI {
                 mouseY = DebugScreen.REAL_MOUSE_POS.y;
             }
             animationEngine.updateFrame();
+
+            // Before layout so tree changes made by a callback are laid out in this same frame.
+            runFrameCallbacks();
 
             calculateStyleAndLayout();
 

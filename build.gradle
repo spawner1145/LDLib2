@@ -31,70 +31,74 @@ configurations {
     runtimeClasspath.extendsFrom localRuntime
 }
 
-repositories {
-    // NeoGradle's mirrors are asked before mavenCentral(), and a 5xx from one fails the build instead of
-    // falling through, so test-only libraries skip them
-    exclusiveContent {
-        forRepository { mavenCentral() }
-        filter {
-            includeGroupByRegex 'org\\.junit(\\..*)?'
-            includeGroup 'org.mockito'
-            includeGroup 'org.opentest4j'
-            includeGroup 'org.apiguardian'
-            includeGroup 'net.bytebuddy'
-            includeGroup 'org.objenesis'
+// allprojects, not project-local: the add-on modules under module.* resolve LDLib2's own
+// transitives (kotlin-stdlib, yoga, taffy) and would otherwise each need this list copied.
+allprojects {
+    repositories {
+        // NeoGradle's mirrors are asked before mavenCentral(), and a 5xx from one fails the build instead of
+        // falling through, so test-only libraries skip them
+        exclusiveContent {
+            forRepository { mavenCentral() }
+            filter {
+                includeGroupByRegex 'org\\.junit(\\..*)?'
+                includeGroup 'org.mockito'
+                includeGroup 'org.opentest4j'
+                includeGroup 'org.apiguardian'
+                includeGroup 'net.bytebuddy'
+                includeGroup 'org.objenesis'
+            }
         }
-    }
-    mavenCentral()
-    mavenLocal()
-    maven { url = "https://maven.shedaniel.me/" } // Cloth Config, REI
-    maven {
-        name = "Modrinth"
-        url = "https://api.modrinth.com/maven"
-        content {
-            includeGroup "maven.modrinth"
+        mavenCentral()
+        mavenLocal()
+        maven { url = "https://maven.shedaniel.me/" } // Cloth Config, REI
+        maven {
+            name = "Modrinth"
+            url = "https://api.modrinth.com/maven"
+            content {
+                includeGroup "maven.modrinth"
+            }
+        } // Modrinth File
+        maven {
+            name = "CurseForge"
+            url = "https://cursemaven.com"
+        } // CurseForge
+        maven {
+            // location of the maven that hosts JEI files since January 2023
+            name = "Jared's maven"
+            url = "https://maven.blamejared.com/"
         }
-    } // Modrinth File
-    maven {
-        name = "CurseForge"
-        url = "https://cursemaven.com"
-    } // CurseForge
-    maven {
-        // location of the maven that hosts JEI files since January 2023
-        name = "Jared's maven"
-        url = "https://maven.blamejared.com/"
-    }
-    maven {
-        // location of a maven mirror for JEI files, as a fallback
-        name = "ModMaven"
-        url = "https://modmaven.dev"
-    }
-    maven { url = "https://maven.parchmentmc.org" } // Parchment mappings
-    maven { url = "https://maven.quiltmc.org/repository/release" } // Quilt Mappings
-    maven { // Flywheel
-        url = "https://maven.tterrag.com/"
-        content {
-            // need to be specific here due to version overlaps
-            includeGroup("com.jozufozu.flywheel")
+        maven {
+            // location of a maven mirror for JEI files, as a fallback
+            name = "ModMaven"
+            url = "https://modmaven.dev"
         }
-    }
-    // mavens for Forge-exclusives
-    maven { url = "https://maven.theillusivec4.top/" } // Curios
-    maven { url = "https://maven.terraformersmc.com/releases/" } // Mod Menu, EMI
-    maven { // Create Forge and Registrate Forge
-        url = "https://maven.tterrag.com/"
-        content {
-            includeGroup("com.tterrag.registrate")
-            includeGroup("com.simibubi.create")
+        maven { url = "https://maven.parchmentmc.org" } // Parchment mappings
+        maven { url = "https://maven.quiltmc.org/repository/release" } // Quilt Mappings
+        maven { // Flywheel
+            url = "https://maven.tterrag.com/"
+            content {
+                // need to be specific here due to version overlaps
+                includeGroup("com.jozufozu.flywheel")
+            }
         }
-    }
-    maven { url = "https://jitpack.io/" } // Mixin Extras, Fabric ASM
-    maven {
-        // saps.dev Maven (KubeJS and Rhino)
-        url "https://maven.latvian.dev/releases"
-        content {
-            includeGroup "dev.latvian.mods"
-            includeGroup "dev.latvian.apps"
+        // mavens for Forge-exclusives
+        maven { url = "https://maven.theillusivec4.top/" } // Curios
+        maven { url = "https://maven.terraformersmc.com/releases/" } // Mod Menu, EMI
+        maven { // Create Forge and Registrate Forge
+            url = "https://maven.tterrag.com/"
+            content {
+                includeGroup("com.tterrag.registrate")
+                includeGroup("com.simibubi.create")
+            }
+        }
+        maven { url = "https://jitpack.io/" } // Mixin Extras, Fabric ASM
+        maven {
+            // saps.dev Maven (KubeJS and Rhino)
+            url "https://maven.latvian.dev/releases"
+            content {
+                includeGroup "dev.latvian.mods"
+                includeGroup "dev.latvian.apps"
+            }
         }
     }
 }
